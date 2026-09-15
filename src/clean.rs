@@ -29,6 +29,26 @@ impl MatchMode {
     }
 }
 
+/// Deletion granularity for matched sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMode {
+    /// Move the whole set folder to the recycle bin.
+    Set,
+    /// Move only the matched difficulties' .osu files; a folder left with
+    /// no .osu files is removed as well.
+    Map,
+}
+
+impl TargetMode {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Set => "整组移除",
+            Self::Map => "仅移除匹配难度",
+        }
+    }
+}
+
 /// A beatmap set: every db entry sharing one Songs/ folder.
 #[derive(Debug, Clone)]
 pub struct BeatmapSet {
@@ -36,22 +56,41 @@ pub struct BeatmapSet {
     pub artist: String,
     pub title: String,
     pub creator: String,
-    pub maps: Vec<MapInfo>,
+    pub maps: Vec<Difficulty>,
+}
+
+/// One difficulty inside a set: matching attributes plus the .osu file
+/// location recorded in the db.
+#[derive(Debug, Clone)]
+pub struct Difficulty {
+    pub info: MapInfo,
+    /// .osu file name relative to the set folder; `None` when the db has none.
+    pub osu_file: Option<String>,
+    /// Content md5 of the .osu file per the db; verified against the on-disk
+    /// file before any per-difficulty deletion.
+    pub md5: Option<String>,
 }
 
 impl BeatmapSet {
     #[must_use]
     pub fn matches(&self, expr: &Expr, mode: MatchMode) -> bool {
-        let mut results = self.maps.iter().map(|m| expr.matches(m));
+        let mut results = self.maps.iter().map(|d| expr.matches(&d.info));
         match mode {
             MatchMode::Any => results.any(|b| b),
             MatchMode::All => results.all(|b| b),
         }
     }
 
+    pub fn matched_difficulties<'a>(
+        &'a self,
+        expr: &'a Expr,
+    ) -> impl Iterator<Item = &'a Difficulty> + 'a {
+        self.maps.iter().filter(move |d| expr.matches(&d.info))
+    }
+
     #[must_use]
     pub fn matched_count(&self, expr: &Expr) -> usize {
-        self.maps.iter().filter(|m| expr.matches(m)).count()
+        self.matched_difficulties(expr).count()
     }
 
     #[must_use]
@@ -74,7 +113,7 @@ pub fn group_sets(beatmaps: &[Beatmap]) -> (Vec<BeatmapSet>, usize) {
             skipped += 1;
             continue;
         };
-        let info = to_info(b);
+        let info = to_difficulty(b);
         if let Some(&i) = index.get(folder) {
             sets[i].maps.push(info);
         } else {
@@ -99,13 +138,14 @@ pub fn group_sets(beatmaps: &[Beatmap]) -> (Vec<BeatmapSet>, usize) {
     (sets, skipped)
 }
 
-/// A db folder entry must be a pure relative path: at least one component,
-/// every component `Normal`. Newer osu! versions store some sets in subfolders
-/// (e.g. `<set>\mini`), so multiple levels are allowed; anything containing
-/// `..`, `.`, a root, drive or UNC prefix is rejected so a corrupt or hostile
-/// db entry can never point the deleter outside Songs/.
+/// A db path entry (set folder or .osu file name) must be a pure relative
+/// path: at least one component, every component `Normal`. Newer osu!
+/// versions store some sets in subfolders (e.g. `<set>\mini`), so multiple
+/// levels are allowed; anything containing `..`, `.`, a root, drive or UNC
+/// prefix is rejected so a corrupt or hostile db entry can never point the
+/// deleter outside Songs/.
 #[must_use]
-pub fn is_safe_folder_path(name: &str) -> bool {
+pub fn is_safe_rel_path(name: &str) -> bool {
     let mut count = 0;
     for component in Path::new(name).components() {
         if !matches!(component, Component::Normal(_)) {
@@ -140,18 +180,51 @@ pub fn dir_size(path: &Path) -> u64 {
     total
 }
 
-fn to_info(b: &Beatmap) -> MapInfo {
-    MapInfo {
-        mode: conv_mode(b.mode),
-        status: conv_status(b.status),
-        star: nomod_star(b),
-        cs: f64::from(b.circle_size),
-        ar: f64::from(b.approach_rate),
-        od: f64::from(b.overall_difficulty),
-        hp: f64::from(b.hp_drain),
-        // osu!.db stores total time in milliseconds, drain time in seconds.
-        length: f64::from(b.total_time) / 1000.0,
-        drain: f64::from(b.drain_time),
+/// Recursively count `*.osu` files (case-insensitive extension) in a set
+/// folder. Decides whether a folder is empty of difficulties after
+/// per-difficulty deletion, so symlinks are skipped like in [`dir_size`].
+#[must_use]
+pub fn count_osu_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            count += count_osu_files(&entry.path());
+        } else if entry
+            .path()
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("osu"))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn to_difficulty(b: &Beatmap) -> Difficulty {
+    Difficulty {
+        info: MapInfo {
+            mode: conv_mode(b.mode),
+            status: conv_status(b.status),
+            star: nomod_star(b),
+            cs: f64::from(b.circle_size),
+            ar: f64::from(b.approach_rate),
+            od: f64::from(b.overall_difficulty),
+            hp: f64::from(b.hp_drain),
+            // osu!.db stores total time in milliseconds, drain time in seconds.
+            length: f64::from(b.total_time) / 1000.0,
+            drain: f64::from(b.drain_time),
+        },
+        osu_file: b.file_name.clone(),
+        md5: b.md5.clone(),
     }
 }
 
@@ -196,7 +269,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safe_folder_paths() {
+    fn safe_rel_paths() {
         for good in [
             "12345 artist - title",
             "a",
@@ -204,8 +277,9 @@ mod tests {
             "a b (c)",
             "123 x\\mini",
             "123/456",
+            "a b (c) [d].osu",
         ] {
-            assert!(is_safe_folder_path(good), "should be safe: {good:?}");
+            assert!(is_safe_rel_path(good), "should be safe: {good:?}");
         }
         for bad in [
             "",
@@ -219,28 +293,32 @@ mod tests {
             "C:",
             "\\\\srv\\share",
         ] {
-            assert!(!is_safe_folder_path(bad), "should be unsafe: {bad:?}");
+            assert!(!is_safe_rel_path(bad), "should be unsafe: {bad:?}");
         }
     }
 
     fn set_with_stars(stars: &[Option<f64>]) -> BeatmapSet {
-        let mania_info = |star: Option<f64>| MapInfo {
-            star,
-            mode: Mode::Mania,
-            status: Status::Ranked,
-            cs: 7.0,
-            ar: 9.5,
-            od: 8.0,
-            hp: 8.0,
-            length: 90.0,
-            drain: 80.0,
+        let mania_info = |(i, &star): (usize, &Option<f64>)| Difficulty {
+            info: MapInfo {
+                star,
+                mode: Mode::Mania,
+                status: Status::Ranked,
+                cs: 7.0,
+                ar: 9.5,
+                od: 8.0,
+                hp: 8.0,
+                length: 90.0,
+                drain: 80.0,
+            },
+            osu_file: Some(format!("diff{i}.osu")),
+            md5: None,
         };
         BeatmapSet {
             folder: "f".into(),
             artist: "a".into(),
             title: "t".into(),
             creator: "c".into(),
-            maps: stars.iter().map(|&star| mania_info(star)).collect(),
+            maps: stars.iter().enumerate().map(mania_info).collect(),
         }
     }
 
@@ -260,5 +338,30 @@ mod tests {
         let unknown = set_with_stars(&[None, Some(2.0)]);
         assert!(unknown.matches(&expr, MatchMode::Any));
         assert!(!unknown.matches(&expr, MatchMode::All));
+    }
+
+    #[test]
+    fn matched_difficulties_carry_files() {
+        let expr = Expr::parse("star<3").unwrap();
+        let set = set_with_stars(&[Some(2.0), Some(5.0), Some(1.0)]);
+        let files: Vec<&str> = set
+            .matched_difficulties(&expr)
+            .map(|d| d.osu_file.as_deref().unwrap())
+            .collect();
+        assert_eq!(files, ["diff0.osu", "diff2.osu"]);
+    }
+
+    #[test]
+    fn osu_file_count_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.osu"), b"x").unwrap();
+        std::fs::write(root.join("b.OSU"), b"x").unwrap();
+        std::fs::write(root.join("c.txt"), b"x").unwrap();
+        std::fs::create_dir(root.join("mini")).unwrap();
+        std::fs::write(root.join("mini").join("d.osu"), b"x").unwrap();
+        assert_eq!(count_osu_files(root), 3);
+        assert_eq!(count_osu_files(&root.join("mini")), 1);
+        assert_eq!(count_osu_files(&root.join("nonexistent")), 0);
     }
 }

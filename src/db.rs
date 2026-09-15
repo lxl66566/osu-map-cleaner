@@ -55,7 +55,11 @@ pub struct Beatmap {
     pub drain_time: u32,
     /// Total time in milliseconds.
     pub total_time: u32,
+    /// Content md5 of the difficulty's .osu file, hex-encoded.
+    pub md5: Option<String>,
     pub folder_name: Option<String>,
+    /// The difficulty's .osu file name, relative to the set folder.
+    pub file_name: Option<String>,
 }
 
 // Version thresholds of the format, as used by osu-db.
@@ -180,8 +184,8 @@ impl Reader<'_> {
         let creator = self.string()?;
         let _difficulty_name = self.string()?;
         let _audio = self.string()?;
-        let _hash = self.string()?;
-        let _file_name = self.string()?;
+        let md5 = self.string()?;
+        let file_name = self.string()?;
         let status = self.u8()?;
         let _circles = self.u16()?;
         let _sliders = self.u16()?;
@@ -265,7 +269,9 @@ impl Reader<'_> {
             ratings,
             drain_time,
             total_time,
+            md5,
             folder_name,
+            file_name,
         })
     }
 
@@ -446,6 +452,8 @@ mod tests {
         assert_eq!(parsed.beatmaps.len(), 1);
         let b = &parsed.beatmaps[0];
         assert_eq!(b.folder_name.as_deref(), Some("42 artist - title"));
+        assert_eq!(b.file_name.as_deref(), Some("file.osu"));
+        assert_eq!(b.md5.as_deref(), Some("md5"));
         assert_eq!(b.mode, 3);
         assert_eq!(b.circle_size, 7.0);
         assert_eq!(b.total_time, 90_500);

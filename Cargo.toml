@@ -3,7 +3,7 @@ name         = "osu-map-cleaner"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
-description  = "Filter osu! beatmap sets with an expression and move matched sets to the recycle bin."
+description  = "Filter osu! beatmaps with an expression and move matched difficulties or whole sets to the recycle bin."
 repository   = "https://github.com/lxl66566/osu-map-cleaner"
 license      = "MIT OR Apache-2.0"
 keywords     = ["beatmap", "cleaner", "cli", "osu"]
@@ -13,7 +13,9 @@ include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/sr
 [dependencies]
 anyhow    = "1.0.104"
 clap      = { version = "4.6.7", features = ["derive"] }
+hex-simd  = "0.8.0"
 inquire   = "0.9.4"
+md-5      = "0.11.0"
 thiserror = "2.0.20"
 trash     = "5.2.9"
 
@@ -30,6 +32,9 @@ wildcard_imports        = "allow"
 [lints.rust]
 unsafe_code           = "allow"
 unused_qualifications = "warn"
+
+[dev-dependencies]
+tempfile = "3.27.0"
 
 # If you are building bin target, uncomment this
 # [profile.release]
