@@ -1,0 +1,39 @@
+[package]
+name         = "osu-map-cleaner"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "Filter osu! beatmap sets with an expression and move matched sets to the recycle bin."
+repository   = "https://github.com/lxl66566/osu-map-cleaner"
+license      = "MIT OR Apache-2.0"
+keywords     = ["beatmap", "cleaner", "cli", "osu"]
+categories   = ["command-line-utilities"]
+include      = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
+
+[dependencies]
+anyhow    = "1.0.104"
+clap      = { version = "4.6.7", features = ["derive"] }
+inquire   = "0.9.4"
+thiserror = "2.0.20"
+trash     = "5.2.9"
+
+[lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
+
+[lints.rust]
+unsafe_code           = "allow"
+unused_qualifications = "warn"
+
+# If you are building bin target, uncomment this
+# [profile.release]
+# lto       = true
+# opt-level = "s"
+# panic     = "abort"
+# strip     = true
