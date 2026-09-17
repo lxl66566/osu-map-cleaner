@@ -13,7 +13,8 @@ use hex_simd::{AsciiCase, encode_to_string};
 use md5::{Digest, Md5};
 use osu_map_cleaner::{
     clean::{self, BeatmapSet, MatchMode, TargetMode},
-    expr::Expr,
+    expr::{Expr, NumField},
+    stars,
 };
 
 #[derive(Parser)]
@@ -49,6 +50,10 @@ struct Args {
     /// 仅预览匹配结果，不删除
     #[arg(long)]
     dry_run: bool,
+
+    /// 用 rosu-pp 本地补算缺失的星数（osu! 对批量导入的谱面不写星数）
+    #[arg(long)]
+    calc_star: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +125,7 @@ fn run() -> Result<()> {
     })?;
     let db = osu_map_cleaner::db::parse(&db_bytes)
         .with_context(|| format!("解析 {} 失败（db 版本不受支持？）", db_path.display()))?;
-    let (sets, skipped) = clean::group_sets(&db.beatmaps);
+    let (mut sets, skipped) = clean::group_sets(&db.beatmaps);
     println!(
         "共 {} 张谱面, {} 个谱面集 (db 版本 {}{})",
         db.beatmaps.len(),
@@ -132,6 +137,32 @@ fn run() -> Result<()> {
             String::new()
         }
     );
+
+    let unknown_stars = sets
+        .iter()
+        .flat_map(|s| &s.maps)
+        .filter(|d| d.info.star.is_none())
+        .count();
+    if args.calc_star {
+        println!("补算星数: {unknown_stars} 个难度缺失（rosu-pp, lazer 算法, 离线并行）…");
+        let stats = stars::fill_missing_stars(&mut sets, &songs_dir);
+        println!(
+            "星数补算完成: 成功 {} | 文件缺失 {} | 无文件名 {} | 路径异常 {} | 计算失败 {}",
+            stats.computed,
+            stats.missing_file,
+            stats.no_file_name,
+            stats.unsafe_name,
+            stats.calc_failed
+        );
+        if stats.computed > 0 {
+            println!("提示: 补算值为 osu!lazer 算法，与 osu! 显示可能有细微偏差（实测 <0.5 星）");
+        }
+    } else if unknown_stars > 0 && expr.uses_num_field(NumField::Star) {
+        println!(
+            "提示: {unknown_stars} 个难度星数未知（osu! 未计算），star 条件不会匹配它们；加 \
+             --calc-star 可本地补算"
+        );
+    }
 
     // Resolve folders for all sets (not only matched ones) so the
     // "matched everything?" guard counts what actually exists on disk.

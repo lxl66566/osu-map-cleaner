@@ -16,6 +16,8 @@ clap      = { version = "4.6.7", features = ["derive"] }
 hex-simd  = "0.8.0"
 inquire   = "0.9.4"
 md-5      = "0.11.0"
+rayon = "1.12.0"
+rosu-pp = "4.0.1"
 thiserror = "2.0.20"
 trash     = "5.2.9"
 

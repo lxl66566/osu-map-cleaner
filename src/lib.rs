@@ -5,3 +5,4 @@
 pub mod clean;
 pub mod db;
 pub mod expr;
+pub mod stars;

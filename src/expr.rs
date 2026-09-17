@@ -302,6 +302,15 @@ impl Expr {
     pub fn matches(&self, m: &MapInfo) -> bool {
         self.conds.iter().all(|c| c.matches(m))
     }
+
+    /// Whether any condition reads the given numeric field; used to decide
+    /// whether backfilling that field is worth the effort.
+    #[must_use]
+    pub fn uses_num_field(&self, field: NumField) -> bool {
+        self.conds
+            .iter()
+            .any(|c| matches!(c, Cond::Num { field: f, .. } if *f == field))
+    }
 }
 
 impl fmt::Display for Expr {
