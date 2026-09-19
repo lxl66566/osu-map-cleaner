@@ -1,11 +1,21 @@
-//! Read-only Songs/ usage report: what the space is made of, size
-//! distribution per gamemode and per star range, plus biggest offenders.
+//! Read-only Songs/ usage report: what the space is made of, and its
+//! distribution across gamemode (mania per key count) and star range.
+//!
+//! Unlike the cleaner itself this is analysis-only; it never deletes.
+//! Sizing semantics:
+//! - Whole-folder reports (composition, tops) use raw directory sizes.
+//! - Mode/star reports split each folder across its difficulties: audio
+//!   files are divided among the difficulties referencing them, everything
+//!   else (backgrounds, videos, ...) equally among all difficulties. Mixed
+//!   std+mania sets therefore land in both modes instead of a "mixed" bin.
+//! - Stars come from the db's nomod value; missing ones are backfilled
+//!   locally with rosu-pp (lazer algorithm), matching `stars.rs` safety.
 //!
 //! Usage: cargo run --release --example analyze -- [osu_dir]
 
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     ops::AddAssign,
     path::{Path, PathBuf},
@@ -15,15 +25,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, bail};
-use osu_map_cleaner::{
-    clean::{BeatmapSet, group_sets},
-    db,
-    expr::Mode,
-};
+use osu_map_cleaner::{clean::is_safe_rel_path, db};
+use rayon::prelude::*;
+use rosu_pp::model::mode::GameMode;
 
 const GIB: f64 = 1_073_741_824.0;
 const MIB: f64 = 1_048_576.0;
@@ -73,80 +81,198 @@ impl Category {
     }
 }
 
-/// Gamemode of a whole set folder; mixed when difficulties disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SetMode {
-    Std,
-    Taiko,
-    Catch,
-    Mania,
-    Mixed,
+// ---- per-difficulty model ----
+
+/// One difficulty: everything the mode/star distribution needs.
+struct Diff {
+    mode: u8,
+    circle_size: f32,
+    star: Option<f64>,
+    /// Audio file name (lowercased) as recorded in the db.
+    audio: Option<String>,
+    /// .osu file name for star backfill.
+    file: Option<String>,
 }
 
-impl SetMode {
-    fn unified(mode: Mode) -> Self {
-        match mode {
-            Mode::Standard => Self::Std,
-            Mode::Taiko => Self::Taiko,
-            Mode::Catch => Self::Catch,
-            Mode::Mania => Self::Mania,
-        }
-    }
+/// All db entries of one Songs folder.
+struct Set {
+    folder: String,
+    diffs: Vec<Diff>,
+}
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Std => "std",
-            Self::Taiko => "taiko",
-            Self::Catch => "catch",
-            Self::Mania => "mania",
-            Self::Mixed => "mixed",
-        }
+/// Bucket key: 0/1/2 = std/taiko/catch, 100+k = mania with k keys.
+/// Star: -1 unknown, 0 = <1★, 1..=9 = k..k+1★, 10 = 10+★.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Bucket {
+    mode_key: u16,
+    star: i8,
+}
+
+fn mode_key_of(mode: u8, cs: f32) -> u16 {
+    match mode {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        // mania: rounded CS is the key count, legal range 1..=18
+        3 => {
+            #[allow(clippy::cast_possible_truncation)] // clamped right after
+            let k = f64::from(cs).round() as i16;
+            (100 + u16::try_from(k.clamp(1, 18)).unwrap_or(18)).min(118)
+        },
+        _ => 999,
     }
 }
 
-/// Star bucket of a set, by its hardest nomod difficulty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum StarBucket {
-    Under1,
-    From1To3,
-    From3To4,
-    From4To5,
-    From5To6,
-    Over6,
-    Unknown,
+fn mode_label(mk: u16) -> String {
+    match mk {
+        0 => "std".to_owned(),
+        1 => "taiko".to_owned(),
+        2 => "catch".to_owned(),
+        k if (100..118).contains(&k) => format!("mania {}K", k - 100),
+        k if k == 118 => "mania 18K+".to_owned(),
+        _ => format!("mode{mk}"),
+    }
 }
 
-impl StarBucket {
-    fn from_star(star: Option<f64>) -> Self {
-        let Some(s) = star else {
-            return Self::Unknown;
-        };
-        if s < 1.0 {
-            Self::Under1
-        } else if s < 3.0 {
-            Self::From1To3
-        } else if s < 4.0 {
-            Self::From3To4
-        } else if s < 5.0 {
-            Self::From4To5
-        } else if s < 6.0 {
-            Self::From5To6
-        } else {
-            Self::Over6
-        }
+fn star_bucket(star: Option<f64>) -> i8 {
+    let Some(s) = star.filter(|s| s.is_finite()) else {
+        return -1;
+    };
+    if s < 1.0 {
+        return 0;
     }
+    #[allow(clippy::cast_possible_truncation)] // clamped right after
+    let k = s.floor() as i8;
+    k.clamp(1, 10)
+}
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Under1 => "<1",
-            Self::From1To3 => "1-3",
-            Self::From3To4 => "3-4",
-            Self::From4To5 => "4-5",
-            Self::From5To6 => "5-6",
-            Self::Over6 => "6+",
-            Self::Unknown => "?",
-        }
+fn star_label(s: i8) -> String {
+    match s {
+        -1 => "未知".to_owned(),
+        0 => "<1★".to_owned(),
+        10 => "10+★".to_owned(),
+        k => format!("{k}-{k2}★", k2 = k + 1),
     }
+}
+
+/// Same rules as `clean::nomod_star`.
+fn nomod_star(b: &db::Beatmap) -> Option<f64> {
+    let ratings = &b.ratings[usize::from(b.mode)];
+    ratings
+        .iter()
+        .find(|&&(mods, _)| mods == 0)
+        .map(|&(_, sr)| sr)
+        .filter(|&sr| sr > 0.0)
+        .or_else(|| ratings.iter().map(|&(_, sr)| sr).find(|&sr| sr > 0.0))
+}
+
+// ---- star backfill ----
+
+#[derive(Default)]
+struct FillStats {
+    computed: usize,
+    skipped: usize,
+    missing: usize,
+    failed: usize,
+}
+
+impl AddAssign for FillStats {
+    fn add_assign(&mut self, o: Self) {
+        self.computed += o.computed;
+        self.skipped += o.skipped;
+        self.missing += o.missing;
+        self.failed += o.failed;
+    }
+}
+
+/// Fill in stars for difficulties without a db value. Same safety rules as
+/// `stars.rs`: unsafe names, missing files and uncomputable maps stay
+/// unknown; only positive stars are accepted.
+fn fill_stars(sets: &mut [Set], songs: &Path) -> FillStats {
+    const PROGRESS_EVERY: usize = 4_000;
+    let total = sets.len();
+    let done = Arc::new(AtomicUsize::new(0));
+    let stats = Arc::new(AtomicUsize::new(0)); // computed, for progress only
+    let out = sets
+        .par_iter_mut()
+        .map(|s| {
+            let mut st = FillStats::default();
+            let folder_ok = is_safe_rel_path(&s.folder);
+            for d in &mut s.diffs {
+                if d.star.is_some() {
+                    continue;
+                }
+                let Some(name) = d.file.as_deref().filter(|n| is_safe_rel_path(n)) else {
+                    st.skipped += 1;
+                    continue;
+                };
+                if !folder_ok {
+                    st.skipped += 1;
+                    continue;
+                }
+                let path = songs.join(&s.folder).join(name);
+                if !path.is_file() {
+                    st.missing += 1;
+                    continue;
+                }
+                match compute_star(&path, d.mode) {
+                    Some(sr) => {
+                        d.star = Some(sr);
+                        st.computed += 1;
+                    },
+                    None => st.failed += 1,
+                }
+            }
+            if st.computed > 0 {
+                stats.fetch_add(st.computed, Ordering::Relaxed);
+            }
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % PROGRESS_EVERY == 0 {
+                eprintln!("星数补算 {n}/{total} 集（已算 {} 个）", stats.load(Ordering::Relaxed));
+            }
+            st
+        })
+        .reduce(FillStats::default, |mut a, b| {
+            a += b;
+            a
+        });
+    eprintln!();
+    out
+}
+
+/// Same rules as `stars.rs`: empty maps, mode mismatches and failures
+/// yield `None`; only positive stars are returned.
+fn compute_star(path: &Path, mode: u8) -> Option<f64> {
+    let map = rosu_pp::Beatmap::from_path(path).ok()?;
+    if map.hit_objects.is_empty() {
+        return None;
+    }
+    let target = match mode {
+        0 => GameMode::Osu,
+        1 => GameMode::Taiko,
+        2 => GameMode::Catch,
+        _ => GameMode::Mania,
+    };
+    if target != map.mode && map.mode != GameMode::Osu {
+        return None;
+    }
+    let diff = rosu_pp::Difficulty::new();
+    let stars = match target {
+        GameMode::Osu => diff.checked_calculate_for_mode::<rosu_pp::osu::Osu>(&map).ok()?.stars,
+        GameMode::Taiko => diff
+            .checked_calculate_for_mode::<rosu_pp::taiko::Taiko>(&map)
+            .ok()?
+            .stars,
+        GameMode::Catch => diff
+            .checked_calculate_for_mode::<rosu_pp::catch::Catch>(&map)
+            .ok()?
+            .stars,
+        GameMode::Mania => diff
+            .checked_calculate_for_mode::<rosu_pp::mania::Mania>(&map)
+            .ok()?
+            .stars,
+    };
+    (stars > 0.0).then_some(stars)
 }
 
 // ---- scan structures ----
@@ -164,13 +290,21 @@ impl AddAssign for Acc {
     }
 }
 
+/// One scanned top-level Songs folder.
+struct DirInfo {
+    name: String,
+    size: u64,
+    files: u64,
+    /// (lowercased file name, size) of every file in the tree.
+    list: Vec<(String, u64)>,
+}
+
 /// Per-worker scan results, merged after all workers join.
 #[derive(Default)]
 struct Scan {
     cat: HashMap<Category, Acc>,
     ext: HashMap<String, Acc>,
-    /// One row per top-level Songs folder.
-    sets: Vec<(String, u64, u64)>,
+    dirs: Vec<DirInfo>,
     /// Files of at least BIG_FILE bytes, path relative to Songs/.
     big: Vec<(u64, PathBuf, Category)>,
     errors: usize,
@@ -184,14 +318,14 @@ impl Scan {
         for (k, v) in o.ext {
             *self.ext.entry(k).or_default() += v;
         }
-        self.sets.extend(o.sets);
+        self.dirs.extend(o.dirs);
         self.big.extend(o.big);
         self.errors += o.errors;
     }
 }
 
 /// Recursively scan one folder tree into `scan`.
-fn walk(dir: &Path, root: &Path, scan: &mut Scan, size: &mut u64, files: &mut u64) {
+fn walk(dir: &Path, root: &Path, scan: &mut Scan, size: &mut u64, files: &mut u64, list: &mut Vec<(String, u64)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         scan.errors += 1;
         return;
@@ -205,7 +339,7 @@ fn walk(dir: &Path, root: &Path, scan: &mut Scan, size: &mut u64, files: &mut u6
             continue;
         }
         if ft.is_dir() {
-            walk(&entry.path(), root, scan, size, files);
+            walk(&entry.path(), root, scan, size, files, list);
             continue;
         }
         let Ok(meta) = entry.metadata() else {
@@ -213,6 +347,7 @@ fn walk(dir: &Path, root: &Path, scan: &mut Scan, size: &mut u64, files: &mut u6
             continue;
         };
         let s = meta.len();
+        let name = entry.file_name().to_string_lossy().into_owned();
         let ext = entry
             .path()
             .extension()
@@ -227,6 +362,7 @@ fn walk(dir: &Path, root: &Path, scan: &mut Scan, size: &mut u64, files: &mut u6
                 .map_or_else(|_| entry.path(), ToOwned::to_owned);
             scan.big.push((s, path, cat));
         }
+        list.push((name.to_lowercase(), s));
         *size += s;
         *files += 1;
     }
@@ -270,45 +406,47 @@ fn scan_songs(songs: &Path) -> anyhow::Result<(Scan, Acc, usize)> {
                 // round-robin so oversized folders spread across workers
                 for dir in dirs.iter().skip(w).step_by(workers) {
                     let (mut size, mut files) = (0, 0);
-                    walk(dir, songs, &mut local, &mut size, &mut files);
+                    let mut list = Vec::new();
+                    walk(dir, songs, &mut local, &mut size, &mut files, &mut list);
                     let name = dir
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
-                    local.sets.push((name, size, files));
-                    done.fetch_add(1, Ordering::Relaxed);
+                    local.dirs.push(DirInfo {
+                        name,
+                        size,
+                        files,
+                        list,
+                    });
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 2_000 == 0 {
+                        eprint!("\r扫描中 {n}/{total} 个谱面集目录…");
+                    }
                 }
                 local
             }));
         }
-        loop {
-            let n = done.load(Ordering::Relaxed);
-            if n >= total {
-                break;
-            }
-            eprint!("\r扫描中 {n}/{total} 个谱面集目录…");
-            thread::sleep(Duration::from_millis(500));
-        }
-        eprintln!();
         for h in handles {
             scan.merge(h.join().expect("扫描线程 panic"));
         }
     });
+    eprintln!();
     let errors = list_errors + scan.errors;
     Ok((scan, loose, errors))
 }
 
-// ---- db join ----
+// ---- db join & size attribution ----
 
-/// db-side knowledge about one top-level Songs folder.
+/// db-side knowledge about one top-level Songs folder. Difficulties of
+/// nested db folders (`<set>\mini`) sharing the top directory are merged
+/// here so the whole disk folder is attributable.
 struct SetMeta {
-    display: String,
-    diffs: usize,
-    /// None when difficulties of the folder disagree.
-    mode: Option<Mode>,
+    diffs: Vec<(Bucket, Option<String>)>, // bucket + audio name (lowercased)
     /// Negative when no difficulty carries a star rating.
     max_star: f64,
+    /// Set-level mode for the tops listing: unified label or "mixed".
+    unified_mode: Option<u16>,
 }
 
 /// First path component of a db folder entry; newer osu! stores some sets in
@@ -317,85 +455,100 @@ fn top_component(folder: &str) -> &str {
     folder.split(['/', '\\']).next().unwrap_or("")
 }
 
-fn set_metas(sets: &[BeatmapSet]) -> HashMap<String, SetMeta> {
+fn build_metas(sets: &[Set]) -> HashMap<String, SetMeta> {
     let mut metas: HashMap<String, SetMeta> = HashMap::new();
     for set in sets {
         // key lowercased: NTFS is case-insensitive, db/disk may differ in case
         let key = top_component(&set.folder).to_lowercase();
-        let mut modes = set.maps.iter().map(|d| d.info.mode);
-        let first = modes.next();
-        let set_mode = if modes.all(|m| Some(m) == first) {
-            first
-        } else {
-            None
-        };
-        let max_star = set
-            .maps
+        let buckets: Vec<(Bucket, Option<String>)> = set
+            .diffs
             .iter()
-            .filter_map(|d| d.info.star)
+            .map(|d| {
+                (
+                    Bucket {
+                        mode_key: mode_key_of(d.mode, d.circle_size),
+                        star: star_bucket(d.star),
+                    },
+                    d.audio.clone(),
+                )
+            })
+            .collect();
+        let max_star = set
+            .diffs
+            .iter()
+            .filter_map(|d| d.star)
             .fold(f64::NEG_INFINITY, f64::max);
+        let unified = {
+            let mks: HashSet<u16> = buckets.iter().map(|(b, _)| b.mode_key).collect();
+            if mks.len() == 1 {
+                mks.into_iter().next()
+            } else {
+                None
+            }
+        };
         let e = metas.entry(key).or_insert_with(|| SetMeta {
-            display: set.display_name(),
-            diffs: 0,
-            mode: set_mode,
+            diffs: Vec::new(),
             max_star: f64::NEG_INFINITY,
+            unified_mode: unified,
         });
-        e.diffs += set.maps.len();
-        if e.mode != set_mode {
-            e.mode = None;
-        }
+        e.diffs.extend(buckets);
         e.max_star = e.max_star.max(max_star);
+        if e.unified_mode != unified {
+            e.unified_mode = None;
+        }
     }
     metas
 }
 
-/// One disk folder joined with its db metadata (None = not in db).
-struct Joined {
-    dir: String,
-    size: u64,
-    display: Option<String>,
-    diffs: usize,
-    mode: Option<Mode>,
-    max_star: f64,
-}
-
-fn join_db(scan: &Scan, metas: &HashMap<String, SetMeta>) -> Vec<Joined> {
-    scan.sets
-        .iter()
-        .map(|(dir, size, _files)| match metas.get(&dir.to_lowercase()) {
-            Some(m) => Joined {
-                display: Some(m.display.clone()),
-                diffs: m.diffs,
-                mode: m.mode,
-                max_star: m.max_star,
-                dir: dir.clone(),
-                size: *size,
-            },
-            None => Joined {
-                display: None,
-                diffs: 0,
-                mode: None,
-                max_star: f64::NEG_INFINITY,
-                dir: dir.clone(),
-                size: *size,
-            },
-        })
-        .collect()
-}
-
+/// Mode/star aggregation across all attributable folders.
 #[derive(Default)]
-struct Agg {
-    sets: usize,
-    diffs: usize,
-    size: u64,
+struct Dist {
+    buckets: HashMap<Bucket, (u64, u32)>, // size, difficulty count
+    /// Folders containing at least one difficulty of each mode.
+    mode_dirs: HashMap<u16, HashSet<String>>,
+    attributed: u64,
 }
 
-impl Agg {
-    fn add(&mut self, diffs: usize, size: u64) {
-        self.sets += 1;
-        self.diffs += diffs;
-        self.size += size;
+/// Split one folder's size across its difficulties and accumulate into
+/// `dist`. Audio bytes go to the difficulties referencing that audio
+/// (divided among them); everything else is split equally.
+fn attribute(dir: &DirInfo, meta: &SetMeta, dist: &mut Dist) {
+    let n = meta.diffs.len();
+    if n == 0 {
+        return;
     }
+    let mut refs: HashMap<&str, u32> = HashMap::new();
+    for (b, audio) in &meta.diffs {
+        dist.mode_dirs
+            .entry(b.mode_key)
+            .or_default()
+            .insert(dir.name.clone());
+        if let Some(a) = audio.as_deref() {
+            *refs.entry(a).or_default() += 1;
+        }
+    }
+    let mut audio_bytes: HashMap<&str, u64> = HashMap::new();
+    for (name, size) in &dir.list {
+        if refs.contains_key(name.as_str()) {
+            *audio_bytes.entry(name.as_str()).or_default() += size;
+        }
+    }
+    let referenced: u64 = audio_bytes.values().sum();
+    let shared = dir.size.saturating_sub(referenced);
+    #[allow(clippy::cast_sign_loss)] // n > 0 checked above
+    let shared_per = shared / n as u64;
+
+    for (b, audio) in &meta.diffs {
+        let own = audio
+            .as_deref()
+            .and_then(|a| audio_bytes.get(a).copied())
+            .unwrap_or(0)
+            / u64::from(refs.get(audio.as_deref().unwrap_or("")).copied().unwrap_or(1).max(1));
+        let e = dist.buckets.entry(*b).or_default();
+        e.0 += own + shared_per;
+        e.1 += 1;
+    }
+    dist.attributed += dir.size;
 }
 
 // ---- formatting helpers ----
@@ -421,14 +574,14 @@ fn pct(part: u64, total: u64) -> String {
 
 // ---- report sections ----
 
-fn report_overview(joined: &[Joined], total_files: u64, loose: Acc) {
-    let total: u64 = joined.iter().map(|j| j.size).sum();
+fn report_overview(scan: &Scan, total: u64, loose: Acc, fill: &FillStats, unknown_after: usize) {
+    let dirs = scan.dirs.len();
+    let files: u64 = scan.dirs.iter().map(|d| d.files).sum();
     #[allow(clippy::cast_precision_loss)]
-    let avg = total as f64 / joined.len().max(1) as f64 / MIB;
+    let avg = total as f64 / dirs.max(1) as f64 / MIB;
     println!("== 总览 ==");
     println!(
-        "磁盘: {} 个谱面集目录, {total_files} 个文件, 共 {} (平均 {avg:.1} MiB/集)",
-        joined.len(),
+        "磁盘: {dirs} 个谱面集目录, {files} 个文件, 共 {} (平均 {avg:.1} MiB/集)",
         gib(total)
     );
     if loose.count > 0 {
@@ -438,6 +591,12 @@ fn report_overview(joined: &[Joined], total_files: u64, loose: Acc) {
             gib(loose.size)
         );
     }
+    println!(
+        "星数补算 (rosu-pp): 成功 {} | 文件缺失/无名 {} | 失败 {} | 补算后仍未知 {unknown_after}",
+        fill.computed,
+        fill.skipped + fill.missing,
+        fill.failed
+    );
 }
 
 fn report_categories(cat: &HashMap<Category, Acc>, total: u64) {
@@ -475,123 +634,180 @@ fn report_exts(ext: &HashMap<String, Acc>, total: u64) {
     }
 }
 
-fn report_modes(joined: &[Joined], total: u64, unindexed: &Agg) {
-    println!("\n== 模式分布 (大小按整个谱面集目录) ==");
-    println!(
-        "  {:<7} {:>8} {:>8} {:>12}  {:>6}",
-        "mode", "集数", "难度数", "大小", "占比"
-    );
-    let mut by_mode: HashMap<SetMode, Agg> = HashMap::new();
-    for j in joined.iter().filter(|j| j.display.is_some()) {
-        let m = j.mode.map_or(SetMode::Mixed, SetMode::unified);
-        by_mode.entry(m).or_default().add(j.diffs, j.size);
-    }
-    let mut rows: Vec<_> = by_mode.into_iter().collect();
-    rows.sort_unstable_by_key(|(_, a)| Reverse(a.size));
-    for (m, a) in rows {
+fn report_mode(dist: &Dist, total: u64, unindexed: (usize, u64)) {
+    println!("\n== 模式分布 (目录大小按难度分摊; mania 精确到 key) ==");
+    println!("  {:<12} {:>8} {:>8} {:>12}  {:>6}", "mode", "集数*", "难度数", "大小", "占比");
+    let mut mode_keys: Vec<u16> = dist.buckets.keys().map(|b| b.mode_key).collect();
+    mode_keys.sort_unstable();
+    mode_keys.dedup();
+    mode_keys.sort_by_key(|&k| (k >= 100, k)); // std/taiko/catch first, mania by keys
+    for mk in mode_keys {
+        let (size, diffs) = dist
+            .buckets
+            .iter()
+            .filter(|(b, _)| b.mode_key == mk)
+            .fold((0u64, 0u32), |(s, n), (_, (sz, dn))| (s + sz, n + dn));
+        let sets = dist.mode_dirs.get(&mk).map_or(0, HashSet::len);
         println!(
-            "  {:<7} {:>8} {:>8} {:>12}  {:>6}",
-            m.label(),
-            a.sets,
-            a.diffs,
-            gib(a.size),
-            pct(a.size, total)
+            "  {:<12} {:>8} {:>8} {:>12}  {:>6}",
+            mode_label(mk),
+            sets,
+            diffs,
+            gib(size),
+            pct(size, total)
         );
     }
-    if unindexed.sets > 0 {
+    if unindexed.0 > 0 {
         println!(
-            "  {:<7} {:>8} {:>8} {:>12}  {:>6}",
+            "  {:<12} {:>8} {:>8} {:>12}  {:>6}",
             "(未索引)",
-            unindexed.sets,
+            unindexed.0,
             "-",
-            gib(unindexed.size),
-            pct(unindexed.size, total)
+            gib(unindexed.1),
+            pct(unindexed.1, total)
         );
     }
+    println!("* 含该模式难度的目录数；混合目录在多个模式重复计数；难度数仅含磁盘存在的目录");
 }
 
-/// Star availability per mode, explaining the "?" bucket: a difficulty with
-/// no usable rating in the db (osu! computes stars lazily) cannot be bucketed.
-fn report_star_availability(sets: &[BeatmapSet]) {
-    // star availability per mode: [mode, with stars, without]
-    let mut avail: [(Mode, usize, usize); 4] = [
-        (Mode::Standard, 0, 0),
-        (Mode::Taiko, 0, 0),
-        (Mode::Catch, 0, 0),
-        (Mode::Mania, 0, 0),
-    ];
-    let slot = |m: Mode| match m {
-        Mode::Standard => 0,
-        Mode::Taiko => 1,
-        Mode::Catch => 2,
-        Mode::Mania => 3,
-    };
-    for set in sets {
-        for d in &set.maps {
-            let i = slot(d.info.mode);
-            if d.info.star.is_some() {
-                avail[i].1 += 1;
-            } else {
-                avail[i].2 += 1;
-            }
+fn report_mode_star(dist: &Dist, total: u64) {
+    println!("\n== 模式 × 星级分布 (难度级分摊, 含补算星级) ==");
+    let mut mode_keys: Vec<u16> = dist.buckets.keys().map(|b| b.mode_key).collect();
+    mode_keys.sort_unstable();
+    mode_keys.dedup();
+    mode_keys.sort_by_key(|&k| (k >= 100, k));
+    for mk in mode_keys {
+        let subtotal: u64 = dist
+            .buckets
+            .iter()
+            .filter(|(b, _)| b.mode_key == mk)
+            .map(|(_, (s, _))| s)
+            .sum();
+        let label = mode_label(mk);
+        println!("  {label}  小计 {} ({})", gib(subtotal), pct(subtotal, total));
+        let mut stars: Vec<i8> = dist
+            .buckets
+            .iter()
+            .filter(|(b, _)| b.mode_key == mk)
+            .map(|(b, _)| b.star)
+            .collect();
+        stars.sort_unstable();
+        stars.dedup();
+        for s in stars {
+            let Some(&(size, diffs)) = dist.buckets.get(&Bucket {
+                mode_key: mk,
+                star: s,
+            }) else {
+                continue;
+            };
+            println!(
+                "    {:<8} {:>12}  {:>6}  {diffs} 难度",
+                star_label(s),
+                gib(size),
+                pct(size, total)
+            );
         }
     }
-    println!("\n== 星数可用性 (db 中有 nomod 星数的难度比例) ==");
-    for (m, with, without) in avail {
-        let total = with + without;
-        #[allow(clippy::cast_precision_loss)]
-        let rate = with as f64 / total.max(1) as f64 * 100.0;
-        println!(
-            "  {:<7} {with:>8} / {total:<8} ({rate:.1}%)",
-            SetMode::unified(m).label()
-        );
+}
+
+/// Star rows: -1 unknown, 0..=6 = exact bucket, 7 = 7+ (matrix collapse).
+fn matrix_row(star: i8) -> i8 {
+    if star < 0 { -1 } else { star.min(7) }
+}
+
+fn matrix_row_label(r: i8) -> String {
+    match r {
+        -1 => "未知".to_owned(),
+        0 => "<1★".to_owned(),
+        7 => "7+★".to_owned(),
+        k => format!("{k}-{k2}★", k2 = k + 1),
     }
 }
 
-fn report_stars(joined: &[Joined], total: u64) {
-    println!("\n== 星数分布 (按集内最高难度 nomod 星数分桶) ==");
-    println!(
-        "  {:<5} {:>8} {:>8} {:>12}  {:>6}",
-        "星数", "集数", "难度数", "大小", "占比"
-    );
-    let mut by_star: HashMap<StarBucket, Agg> = HashMap::new();
-    for j in joined.iter().filter(|j| j.display.is_some()) {
-        let star = j.max_star.is_finite().then_some(j.max_star);
-        by_star
-            .entry(StarBucket::from_star(star))
-            .or_default()
-            .add(j.diffs, j.size);
-    }
-    let mut rows: Vec<_> = by_star.into_iter().collect();
-    rows.sort_unstable_by_key(|(b, _)| *b);
-    for (b, a) in rows {
-        println!(
-            "  {:<5} {:>8} {:>8} {:>12}  {:>6}",
-            b.label(),
-            a.sets,
-            a.diffs,
-            gib(a.size),
-            pct(a.size, total)
-        );
+fn matrix_col_label(mk: u16) -> String {
+    match mk {
+        0 => "std".to_owned(),
+        1 => "taiko".to_owned(),
+        2 => "catch".to_owned(),
+        118 => "18K+".to_owned(),
+        k if k >= 100 => format!("{}K", k - 100),
+        _ => format!("m{mk}"),
     }
 }
 
-fn report_tops(joined: &mut [Joined], big: &mut [(u64, PathBuf, Category)]) {
-    joined.sort_unstable_by_key(|j| Reverse(j.size));
+/// Compact star × mode size matrix (GiB), 7+ collapsed into one row.
+fn report_matrix(dist: &Dist) {
+    let mut mks: Vec<u16> = dist.buckets.keys().map(|b| b.mode_key).collect();
+    mks.sort_unstable();
+    mks.dedup();
+    mks.sort_by_key(|&k| (k >= 100, k));
+
+    let mut cells: HashMap<(i8, u16), u64> = HashMap::new();
+    let mut row_totals: HashMap<i8, u64> = HashMap::new();
+    let mut col_totals: HashMap<u16, u64> = HashMap::new();
+    for (b, (size, _)) in &dist.buckets {
+        let r = matrix_row(b.star);
+        *cells.entry((r, b.mode_key)).or_default() += size;
+        *row_totals.entry(r).or_default() += size;
+        *col_totals.entry(b.mode_key).or_default() += size;
+    }
+    let rows = [-1i8, 0, 1, 2, 3, 4, 5, 6, 7];
+
+    println!("\n== 星级 × 模式矩阵 (大小, GiB) ==");
+    print!("{:<7}", "");
+    for mk in &mks {
+        print!("{:>7}", matrix_col_label(*mk));
+    }
+    println!("{:>7}", "合计");
+    for r in rows {
+        print!("{:<7}", matrix_row_label(r));
+        for mk in &mks {
+            let size = cells.get(&(r, *mk)).copied().unwrap_or(0);
+            print!("{:>7}", cell(size));
+        }
+        println!("{:>7}", cell(row_totals.get(&r).copied().unwrap_or(0)));
+    }
+    print!("{:<7}", "合计");
+    let grand: u64 = row_totals.values().sum();
+    for mk in &mks {
+        print!("{:>7}", cell(col_totals.get(mk).copied().unwrap_or(0)));
+    }
+    println!("{:>7}", cell(grand));
+}
+
+/// GiB with one decimal; "-" for empty cells.
+#[allow(clippy::cast_precision_loss)]
+fn cell(size: u64) -> String {
+    if size == 0 {
+        "-".to_owned()
+    } else {
+        format!("{:.1}", size as f64 / GIB)
+    }
+}
+
+fn report_tops(dirs: &mut [DirInfo], metas: &HashMap<String, SetMeta>, big: &mut [(u64, PathBuf, Category)]) {
+    dirs.sort_unstable_by_key(|d| Reverse(d.size));
     println!("\n== 最大谱面集 top 20 ==");
-    for (i, j) in joined.iter().take(20).enumerate() {
-        let star = if j.max_star.is_finite() {
-            format!("{:.1}★", j.max_star)
-        } else {
-            "?".into()
+    for (i, d) in dirs.iter().take(20).enumerate() {
+        let (mode, star) = match metas.get(&d.name.to_lowercase()) {
+            Some(m) => (
+                m.unified_mode
+                    .map_or_else(|| "mixed".to_owned(), mode_label),
+                if m.max_star.is_finite() {
+                    format!("{:.1}★", m.max_star)
+                } else {
+                    "?".into()
+                },
+            ),
+            None => ("(未索引)".to_owned(), "?".into()),
         };
         println!(
-            "  {:>2}. {:>12}  {:<5} {:>6}  {}",
+            "  {:>2}. {:>12}  {:<11} {:>6}  {}",
             i + 1,
-            gib(j.size),
-            j.mode.map_or("?", |m| SetMode::unified(m).label()),
+            gib(d.size),
+            mode,
             star,
-            j.display.clone().unwrap_or_else(|| j.dir.clone())
+            d.name
         );
     }
     big.sort_unstable_by_key(|(size, ..)| Reverse(*size));
@@ -621,57 +837,95 @@ fn run(osu_dir: &Path) -> anyhow::Result<()> {
 
     let bytes = fs::read(&db_path).with_context(|| format!("读取 {} 失败", db_path.display()))?;
     let parsed = db::parse(&bytes).with_context(|| format!("解析 {} 失败", db_path.display()))?;
-    let (sets, skipped) = group_sets(&parsed.beatmaps);
-    let metas = set_metas(&sets);
     println!("osu! 目录 : {}", osu_dir.display());
     println!(
-        "数据库   : 版本 {}, {} 张谱面, {} 个谱面集{}",
+        "数据库   : 版本 {}, {} 张谱面",
         parsed.version,
-        parsed.beatmaps.len(),
-        sets.len(),
-        if skipped > 0 {
-            format!(", {skipped} 张无目录名已跳过")
-        } else {
-            String::new()
-        }
+        parsed.beatmaps.len()
     );
 
-    let (mut scan, loose, errors) = scan_songs(&songs)?;
-    let mut joined = join_db(&scan, &metas);
-    let total_files: u64 = scan.sets.iter().map(|(_, _, f)| f).sum();
-    let total: u64 = joined.iter().map(|j| j.size).sum();
+    // group db entries by Songs folder (full folder name)
+    let mut sets: Vec<Set> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for b in &parsed.beatmaps {
+        let Some(folder) = b.folder_name.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let d = Diff {
+            mode: b.mode,
+            circle_size: b.circle_size,
+            star: nomod_star(b),
+            audio: b.audio.as_deref().map(str::to_lowercase),
+            file: b.file_name.clone(),
+        };
+        match index.get(folder) {
+            Some(&i) => sets[i].diffs.push(d),
+            None => {
+                index.insert(folder, sets.len());
+                sets.push(Set {
+                    folder: folder.to_owned(),
+                    diffs: vec![d],
+                });
+            },
+        }
+    }
+    let total_diffs: usize = sets.iter().map(|s| s.diffs.len()).sum();
+    println!("按目录分组: {} 个谱面集, {total_diffs} 个难度", sets.len());
 
-    report_overview(&joined, total_files, loose);
+    let t = Instant::now();
+    let fill = fill_stars(&mut sets, &songs);
+    let unknown_after = sets
+        .iter()
+        .flat_map(|s| &s.diffs)
+        .filter(|d| d.star.is_none())
+        .count();
+    println!("星数补算完成 ({:.1}s)", t.elapsed().as_secs_f32());
+    let metas = build_metas(&sets);
+    drop(sets);
+
+    let (mut scan, loose, errors) = scan_songs(&songs)?;
+    let dirs_total: u64 = scan.dirs.iter().map(|d| d.size).sum();
+    let total = dirs_total + loose.size;
+
+    // attribution across all folders
+    let mut dist = Dist::default();
+    let mut unindexed = (0usize, 0u64);
+    let mut matched_metas = 0usize;
+    for dir in &scan.dirs {
+        match metas.get(&dir.name.to_lowercase()) {
+            Some(meta) => {
+                attribute(dir, meta, &mut dist);
+                matched_metas += 1;
+            },
+            None => {
+                unindexed.0 += 1;
+                unindexed.1 += dir.size;
+            },
+        }
+    }
+    let db_missing = metas.len() - matched_metas;
+
+    report_overview(&scan, total, loose, &fill, unknown_after);
     report_categories(&scan.cat, total);
     report_exts(&scan.ext, total);
+    report_mode(&dist, total, unindexed);
+    report_matrix(&dist);
+    report_mode_star(&dist, total);
+    report_tops(&mut scan.dirs, &metas, &mut scan.big);
 
-    let unindexed: Agg =
-        joined
-            .iter()
-            .filter(|j| j.display.is_none())
-            .fold(Agg::default(), |mut a, j| {
-                a.add(0, j.size);
-                a
-            });
-    report_modes(&joined, total, &unindexed);
-    report_star_availability(&sets);
-    report_stars(&joined, total);
-    report_tops(&mut joined, &mut scan.big);
-
-    let db_missing = metas.len()
-        - joined
-            .iter()
-            .filter(|j| metas.contains_key(&j.dir.to_lowercase()))
-            .count();
     println!("\n== 一致性 ==");
     println!(
-        "db 有而磁盘没有: {db_missing} 集; 磁盘有而 db 没有: {} 集 ({})",
-        unindexed.sets,
-        gib(unindexed.size)
+        "db 有而磁盘没有: {db_missing} 个顶级目录; 磁盘有而 db 没有: {} 个目录 ({})",
+        unindexed.0,
+        gib(unindexed.1)
     );
     if errors > 0 {
         println!("读取失败条目: {errors} (被占用/无权限, 其大小未计入)");
     }
+    println!(
+        "\n注: 模式/星级分布中，音频按引用难度均摊，其余文件按难度数均摊；星级为 db 值 + \
+         rosu-pp(lazer 算法) 补算。"
+    );
     Ok(())
 }
 

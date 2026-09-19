@@ -43,6 +43,8 @@ pub struct Beatmap {
     pub title_ascii: Option<String>,
     pub title_unicode: Option<String>,
     pub creator: Option<String>,
+    /// The difficulty's audio file name, as recorded in the db.
+    pub audio: Option<String>,
     pub status: u8,
     pub mode: u8,
     pub circle_size: f32,
@@ -183,7 +185,7 @@ impl Reader<'_> {
         let title_unicode = self.string()?;
         let creator = self.string()?;
         let _difficulty_name = self.string()?;
-        let _audio = self.string()?;
+        let audio = self.string()?;
         let md5 = self.string()?;
         let file_name = self.string()?;
         let status = self.u8()?;
@@ -260,6 +262,7 @@ impl Reader<'_> {
             title_ascii,
             title_unicode,
             creator,
+            audio,
             status,
             mode,
             circle_size,
